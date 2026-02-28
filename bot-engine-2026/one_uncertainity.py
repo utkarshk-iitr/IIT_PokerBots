@@ -277,10 +277,10 @@ class Player(BaseBot):
         self._preflop_table: dict = _build_preflop_equity_table(iters_per_hand=500)
 
         # Print equity table once at startup (sorted best → worst)
-        # print("\n=== Preflop Equity Table (169 hands) ===")
-        # for hand, eq in sorted(self._preflop_table.items(), key=lambda x: -x[1]):
-        #     print(f"  {hand:<6}  {eq:.3f}  ({eq*100:.1f}%)")
-        # print("==========================================\n")
+        print("\n=== Preflop Equity Table (169 hands) ===")
+        for hand, eq in sorted(self._preflop_table.items(), key=lambda x: -x[1]):
+            print(f"  {hand:<6}  {eq:.3f}  ({eq*100:.1f}%)")
+        print("==========================================\n")
 
         # Opponent modelling accumulators
         self.opp_folds = 0
@@ -304,9 +304,7 @@ class Player(BaseBot):
         self.opp_card_board_str = 0.0    # how well revealed card connects to board
 
         # Auction history for opponent adaptation
-        self.auction_results: list[dict] = []   # list of {my_bid, won, tie}
-        self._auction_wins  = 0   # times we won outright (info_advantage=+1)
-        self._auction_total = 0   # total auctions tracked
+        self.auction_results: list[dict] = []   # list of {my_bid, opp_bid, won}
 
     def _lookup_preflop_equity(self, hand: list[str]) -> float:
         '''Return precomputed HU equity for the given 2-card hand.'''
@@ -425,10 +423,8 @@ class Player(BaseBot):
     # Auction: detect result from state changes on flop street
     # -------------------------------------------------------------------
     def _detect_auction_result(self, s: PokerState):
-        '''
-        Called once on the first post-auction action (flop betting round).
-        Uses opp_revealed_cards and chip deltas to determine who won,
-        then records the result for opponent bid-pattern exploitation.
+        '''Called once when we first enter a post-auction street (flop betting round).
+        Uses opp_revealed_cards to determine who won the auction.
         '''
         if s.opp_revealed_cards:
             # We can see at least one opponent card — we won (or tied)
@@ -436,210 +432,137 @@ class Player(BaseBot):
             self.revealed_opp_card = s.opp_revealed_cards[0]
             self.opp_card_board_str = _opp_card_board_strength(self.revealed_opp_card, s.board)
 
-            # Detect tie vs outright win:
-            #   Win:  we paid opp_bid  (<  our bid)  → chips_in_auction < _auction_my_bid
-            #   Tie:  we paid our_bid  (== our bid)  → chips_in_auction ≈ _auction_my_bid
-            chips_in_total   = STARTING_STACK - s.my_chips
-            chips_in_betting = s.my_wager
-            chips_in_auction = chips_in_total - chips_in_betting  # approx auction cost
-
-            if self._auction_my_bid > 0 and chips_in_auction >= self._auction_my_bid * 0.90:
-                # We paid our full bid → tie
-                self.info_advantage  = 0.0
+            # Check if opponent also sees ours (tie case: both get a card revealed)
+            # In a tie both pay their bids and both see a card.  We detect this
+            # by checking if our chips dropped by our bid amount.  Since we can't
+            # observe opponent's revealed set, assume tie if chips_lost == our bid.
+            chips_lost = STARTING_STACK - s.my_chips - s.my_wager
+            if chips_lost >= self._auction_my_bid and self._auction_my_bid > 0:
+                # Tie auction — both have info. Information advantage ≈ 0.
+                self.info_advantage = 0.0
                 self.opp_won_auction = True
-                self._auction_total += 1
-                self.auction_results.append({'my_bid': self._auction_my_bid, 'won': False, 'tie': True})
             else:
-                # We paid less than our bid → outright win
-                self.info_advantage  = 1.0
+                self.info_advantage = 1.0    # we have info, they don't
                 self.opp_won_auction = False
-                self._auction_wins  += 1
-                self._auction_total += 1
-                self.auction_results.append({'my_bid': self._auction_my_bid, 'won': True, 'tie': False})
         else:
-            # We don't see opponent cards — we lost or both bid 0
+            # We don't see opponent cards — either we lost or both bid 0
             self.won_auction = False
+            # If pot grew beyond pre-auction size, opponent probably won
             expected_pot_no_auction = (STARTING_STACK - s.my_chips - s.my_wager) + \
                                      (STARTING_STACK - s.opp_chips - s.opp_wager)
-            if s.pot > expected_pot_no_auction + 5:   # chips entered pot from auction
+            if s.pot > expected_pot_no_auction + 5:  # some chips went to auction
                 self.opp_won_auction = True
-                self.info_advantage  = -1.0
-                self._auction_total += 1
-                self.auction_results.append({'my_bid': self._auction_my_bid, 'won': False, 'tie': False})
+                self.info_advantage = -1.0   # they see our card, we don't see theirs
             else:
-                # Both bid 0 — no auction effect
                 self.opp_won_auction = False
-                self.info_advantage  = 0.0
+                self.info_advantage = 0.0
 
     # -------------------------------------------------------------------
     # Auction strategy
     # -------------------------------------------------------------------
     def _auction_action(self, game_info: GameInfo, s: PokerState):
         '''
-        Research-backed second-price auction bidding for Sneak Peek Hold'em.
+        Vickrey (second-price) auction strategy.
 
-        ═══════════════════════════════════════════════════════════════════
-        THEORETICAL FOUNDATION
-        ═══════════════════════════════════════════════════════════════════
+        The winner pays the LOSER's bid, so bidding your true value of
+        information is the dominant strategy.  We estimate that value by:
 
-        1. Vickrey (1961) — Second-Price Auction Dominant Strategy:
-           In a sealed-bid second-price auction, bidding true value V is
-           weakly dominant. Win iff V > opp_bid, paying opp_bid < V.
-           Over/under-bidding both reduce expected payoff strictly.
-           → bid = VOI(hand, board, pot)
+          1. Computing flop equity without information.
+          2. Modelling the expected equity IMPROVEMENT from seeing one
+             opponent hole card (reduces opponent's range by ~50%).
+          3. Translating that improvement into expected chip gain ≈
+             pot × Δequity × play_intensity_factor.
 
-        2. Howard (1966) — Value of Information (VOI):
-           VOI = E[payoff | with info] - E[payoff | without info]
-           Winning the auction converts partial knowledge into near-perfect
-           single-card certainty, enabling correct fold/call/bet decisions.
+        We deliberately WIN the auction when:
+          • Equity is in the uncertain zone (35-65%) — information swings
+            our decision the most.
+          • The pot is large enough that even a small equity edge pays off.
+          • We can win cheaply (opponent tends to bid low).
 
-        3. Bowling et al. (2015) — "HU Limit Hold'em is Solved" (Science):
-           Information value ∝ variance reduction in equity estimate.
-           High-entropy spots (equity ≈ 0.50) benefit most. Calibration:
-           ~8-15% of pot at maximally uncertain spots.
-           Approximated by: uncertainty = 4·p·(1-p)  (variance of Bernoulli).
-
-        4. Brown & Sandholm (2017) — Libratus, Science:
-           Subgame principle: auction payoff = EV improvement across all
-           remaining streets. Sneak Peek info is useful over 3 decisions
-           (flop-bet + turn + river) → STREETS_FACTOR ≈ 2.5.
-           Chip preservation: never risk > 15% of stack on information.
-
-        5. Chen & Ankenman (2006) — "Mathematics of Poker" Ch. 14-18:
-           Exploitative deviation from Vickrey when opponent has a
-           measurable bid-pattern tendency (overbid / underbid).
-           Use auction win-rate as a proxy for their bidding level.
-
-        Sneak Peek Hold'em specifics:
-           • Post-flop auction (3 board cards visible) — 2 streets remain.
-           • Winner sees ONE random hole card of opponent.
-           • Second-price: winner pays loser's bid; tie: both pay own bid.
-        ═══════════════════════════════════════════════════════════════════
+        We deliberately LOSE the auction when:
+          • We are very strong (>85% equity) — we'll win anyway.
+          • We are very weak (<25% equity) — info won't save us.
+          • Opponent overbids — let them burn chips, we keep ours.
         '''
-        # Extra MC iters for auction — this is the most critical decision
-        equity  = monte_carlo_equity(s.my_hand, s.board, s.opp_revealed_cards, iters=300)
-        pot     = s.pot
+        equity = monte_carlo_equity(s.my_hand, s.board, s.opp_revealed_cards, iters=120)
+        pot = s.pot
         max_bid = s.my_chips
 
-        # ── Step 1: Core VOI Model (Bowling 2015 + Howard 1966) ──────────────
-        #
-        # uncertainty = 4p(1-p) ∈ [0,1], peaks at 1.0 when equity = 0.50.
-        # This is the variance of Bernoulli(p) and closely tracks Shannon entropy.
+        # ── Information value model ──
+        # Uncertainty peaks at equity=0.5 (range [0,1])
         uncertainty = 4.0 * equity * (1.0 - equity)
 
-        # STREETS_FACTOR: info benefits 3 decision rounds on Sneak Peek (flop-bet
-        # + turn + river). Diminishing returns per street → effective factor 2.5.
-        # VOI_RATE: fraction of pot capturable per unit uncertainty across streets.
-        # Calibrated so that at peak uncertainty (eq=0.5, pot P):
-        #   true_value = P × 0.10 × 1.0 × 2.5 = 0.25 × P   (25% of pot)
-        STREETS_FACTOR = 2.5
-        VOI_RATE       = 0.10
+        # Expected equity improvement from seeing 1 card ≈ 5-12%
+        # scales with uncertainty (more uncertainty → bigger info swing)
+        delta_equity = 0.1*uncertainty  # up to ~8% absolute equity gain
 
-        true_value = pot * VOI_RATE * uncertainty * STREETS_FACTOR
+        # Translate equity improvement to chip value:
+        # If we gain Δeq, we expect to win Δeq × pot more chips on average.
+        # But we also play more optimally with info (folding losers, value-betting
+        # winners), so multiply by a play-intensity factor.
+        play_factor = 1.5 if 0.35 <= equity <= 0.65 else 1.0
+        true_value = pot * delta_equity * play_factor
 
-        # ── Step 2: Strength Asymmetry Corrections ────────────────────────────
-        # Near-certain outcome → information rarely changes the decision.
+        # ── Adjustments ──
 
-        if equity > 0.82:       # very strong: win without info on most runouts
-            true_value *= 0.18
-        elif equity > 0.75:
-            true_value *= 0.38
+        # Very strong hands: info has diminishing value
+        if equity > 0.80:
+            true_value *= 0.15
 
-        if equity < 0.18:       # very weak: fold without info on most runouts
-            true_value *= 0.18
-        elif equity < 0.25:
-            true_value *= 0.38
+        # Very weak hands: not worth paying for info
+        if equity < 0.25:
+            true_value *= 0.2
 
-        # ── Step 3: Board Texture Bonuses ─────────────────────────────────────
-        # Textured boards → opponent's card rank/suit more often changes action.
-        my_suits    = [c[1] for c in s.my_hand]
+        # Drawing hands on the flop benefit extra from info
+        # (suited hand with 2 of suit on board, etc.)
+        my_suits = [c[1] for c in s.my_hand]
         board_suits = [c[1] for c in s.board]
-        board_ranks = [c[0] for c in s.board]
-        my_vals     = sorted([_RANK_VALUE[c[0]] for c in s.my_hand])
-        board_vals  = sorted([_RANK_VALUE[c[0]] for c in s.board])
-
-        # Flush draw: our hand has 2 suited cards matching 2+ board cards
-        flush_bonus = False
         for suit in my_suits:
             if board_suits.count(suit) >= 2:
-                true_value *= 1.25   # suit of opp card is critical information
-                flush_bonus = True
+                true_value *= 1.3
                 break
 
-        # Monotone board: ALL 3 board cards same suit (extreme flush relevance)
-        if len(set(board_suits)) == 1 and not flush_bonus:
-            true_value *= 1.20
-
-        # Straight draw: 4-card window within 5 consecutive ranks
+        # Connected hand near the board → straights possible → info very useful
+        my_vals = sorted([_RANK_VALUE[c[0]] for c in s.my_hand])
+        board_vals = sorted([_RANK_VALUE[c[0]] for c in s.board])
         all_vals = sorted(my_vals + board_vals)
         for i in range(len(all_vals) - 3):
-            if all_vals[i + 3] - all_vals[i] <= 4:
-                true_value *= 1.15
+            if all_vals[i+3] - all_vals[i] <= 4:   # 4-card-in-5 straight draw
+                true_value *= 1.2
                 break
 
-        # Paired board: opponent may have trips/boat draw — rank info critical
-        if len(board_ranks) != len(set(board_ranks)):
-            true_value *= 1.12
+        # ── Opponent adaptation ──
+        if len(self.auction_results) >= 8:
+            opp_bids = [r.get('opp_bid', 0) for r in self.auction_results if r.get('opp_bid') is not None]
+            if opp_bids:
+                avg_opp_bid = sum(opp_bids) / len(opp_bids)
+                median_opp = sorted(opp_bids)[len(opp_bids) // 2]
 
-        # High board (T+): opponent's broadway connectivity matters a lot
-        if board_vals and max(board_vals) >= 10:
-            true_value *= 1.06
+                if avg_opp_bid > pot * 0.25:
+                    # Opponent overbids massively — let them bleed chips
+                    true_value = min(true_value, avg_opp_bid * 0.05)
+                elif avg_opp_bid < BIG_BLIND * 1.5 and uncertainty > 0.5:
+                    # Opponent bids very low — guarantee a cheap win
+                    true_value = max(true_value, median_opp + BIG_BLIND)
+                elif 0.35 <= equity <= 0.65:
+                    # Try to slightly outbid opponent's typical bid
+                    true_value = max(true_value, median_opp + 5)
 
-        # ── Step 4: Pot-Depth Scaling (Libratus subgame principle) ────────────
-        # Larger committed pot → higher absolute stakes of each remaining decision.
-        relative_pot = pot / (2 * STARTING_STACK)
-        true_value  *= (1.0 + 0.25 * relative_pot)
+        # ── Clamp & return ──
+        bid = int(max(0, min(true_value, max_bid)))
 
-        # ── Step 5: Opponent Bid-Pattern Exploitation (Chen & Ankenman) ───────
-        # Deviate from pure Vickrey once we have ≥ 12 auctions observed.
-        # Use our auction win-rate as a proxy for opponent's bid level:
-        #   Low  win-rate (<25%) → opp bids high  → don't over-compete
-        #   High win-rate (>75%) → opp bids low   → we can bid cheaper
-        n_total  = self._auction_total
-        win_rate = self._auction_wins / max(n_total, 1)
+        # FIX #1: NEVER bid 0 on hands where information clearly matters.
+        # If we have decent equity (>=55%), gifting the opponent free info
+        # lets them play perfectly vs. us for the rest of the hand.
+        # Floor the bid so we always compete on meaningful hands.
+        if equity >= 0.65:
+            bid = max(bid, BIG_BLIND * 2)       # premium hand — always compete
+        elif equity >= 0.55:
+            bid = max(bid, BIG_BLIND)            # strong hand — always bid something
+        elif equity >= 0.45:
+            bid = max(bid, BIG_BLIND // 2)       # slight edge — token bid to compete
 
-        if n_total >= 12:
-            if win_rate < 0.25:
-                # Opponent consistently outbids us.
-                # Only fight for high-uncertainty hands; cede the others.
-                if uncertainty > 0.75:
-                    true_value *= 1.40   # must compete in max-uncertainty spots
-                else:
-                    true_value *= 0.55   # not worth overpaying
-            elif win_rate > 0.75:
-                # We win almost every auction — opponent bids very low.
-                # Reduce bids to conserve chips (we'll still win cheaply).
-                true_value *= 0.70
-            elif 0.40 <= win_rate <= 0.60 and uncertainty > 0.60:
-                # Well-calibrated contest — slight upward nudge in key spots.
-                true_value *= 1.10
-
-        # ── Step 6: Final Bid Computation ─────────────────────────────────────
-        bid = int(max(0.0, true_value))
-
-        # FLOOR bids — per Bowling (2015): never bid 0 in uncertain spots.
-        # A bid of even 1 forces opponent to pay ≥ 1 to win (better than free).
-        # Floors calibrated to Sklansky hand tiers + our equity table:
-        if equity >= 0.72:                          # TT+ / AKs  — always contest
-            bid = max(bid, BIG_BLIND * 4)
-        elif equity >= 0.62:                        # 88-99 / AQs-AKo
-            bid = max(bid, BIG_BLIND * 3)
-        elif equity >= 0.55:                        # strong broadway / suited aces
-            bid = max(bid, BIG_BLIND * 2)
-        elif equity >= 0.48:                        # coin-flip territory
-            bid = max(bid, BIG_BLIND)
-        elif equity >= 0.40:                        # slight underdog — token bid
-            bid = max(bid, BIG_BLIND // 2)
-        # Below 0.40: bid = 0 is correct (losing hand, info won't help)
-
-        # CEILING — Libratus principle: chip EV > individual hand EV.
-        # Never pay more than 30% of pot or 15% of stack for information.
-        max_sensible = min(
-            max_bid,
-            max(int(pot * 0.30), int(s.my_chips * 0.15))
-        )
-        bid = min(bid, max_sensible)
-
+        bid = min(bid, max_bid)
         self._auction_my_bid = bid
         return ActionBid(bid)
 

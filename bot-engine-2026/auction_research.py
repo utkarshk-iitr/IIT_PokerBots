@@ -308,6 +308,12 @@ class Player(BaseBot):
         self._auction_wins  = 0   # times we won outright (info_advantage=+1)
         self._auction_total = 0   # total auctions tracked
 
+        # Opponent bid tracking:
+        # In a second-price auction, when WE WIN outright we paid opp's bid
+        # (chips_in_auction = opp_bid). On a tie both paid their own bid.
+        # These observations let us directly model opponent bid behaviour.
+        self._opp_auction_bids: list[int] = []
+
     def _lookup_preflop_equity(self, hand: list[str]) -> float:
         '''Return precomputed HU equity for the given 2-card hand.'''
         key = _hand_canonical_key(hand)
@@ -444,18 +450,22 @@ class Player(BaseBot):
             chips_in_auction = chips_in_total - chips_in_betting  # approx auction cost
 
             if self._auction_my_bid > 0 and chips_in_auction >= self._auction_my_bid * 0.90:
-                # We paid our full bid → tie
+                # We paid our full bid → tie (both bid the same amount)
                 self.info_advantage  = 0.0
                 self.opp_won_auction = True
                 self._auction_total += 1
                 self.auction_results.append({'my_bid': self._auction_my_bid, 'won': False, 'tie': True})
+                # In a tie, opponent's bid ≈ our bid
+                self._opp_auction_bids.append(self._auction_my_bid)
             else:
-                # We paid less than our bid → outright win
+                # We paid less than our bid → outright win; we paid opp's bid
                 self.info_advantage  = 1.0
                 self.opp_won_auction = False
                 self._auction_wins  += 1
                 self._auction_total += 1
                 self.auction_results.append({'my_bid': self._auction_my_bid, 'won': True, 'tie': False})
+                # chips_in_auction is exactly what opponent bid (second-price)
+                self._opp_auction_bids.append(max(0, int(chips_in_auction)))
         else:
             # We don't see opponent cards — we lost or both bid 0
             self.won_auction = False
@@ -590,54 +600,138 @@ class Player(BaseBot):
         relative_pot = pot / (2 * STARTING_STACK)
         true_value  *= (1.0 + 0.25 * relative_pot)
 
-        # ── Step 5: Opponent Bid-Pattern Exploitation (Chen & Ankenman) ───────
-        # Deviate from pure Vickrey once we have ≥ 12 auctions observed.
-        # Use our auction win-rate as a proxy for opponent's bid level:
-        #   Low  win-rate (<25%) → opp bids high  → don't over-compete
-        #   High win-rate (>75%) → opp bids low   → we can bid cheaper
-        n_total  = self._auction_total
-        win_rate = self._auction_wins / max(n_total, 1)
+        # ── Step 5: Dual-Track Opponent Bid Adaptation ───────────────────────
+        # Each time we WIN the auction, chips_in_auction = opp's actual bid
+        # (second-price mechanics). We accumulate these to estimate opp's
+        # typical bid level and adapt in opposite directions:
+        #
+        #   LOW BIDDER  (opp_estimate < VOI_THRESHOLD):
+        #     Bid just barely above their estimate. Winning cheaply is far
+        #     more +EV than the marginal info from overbidding. Chip saved
+        #     now compounds over 1000 rounds.
+        #
+        #   HIGH BIDDER (opp_estimate >= VOI_THRESHOLD):
+        #     Bid competitively to avoid ceding info every hand. Being
+        #     systematically outbid means opponent sees our cards and plays
+        #     perfectly against us, which is deeply -EV.
+        #
+        # VOI_THRESHOLD: the crossover point where the opponent starts
+        # bidding more than our pure-VOI estimate. Below this we're the
+        # natural winner and can shade bids down; above it we must fight.
 
-        if n_total >= 12:
-            if win_rate < 0.25:
-                # Opponent consistently outbids us.
-                # Only fight for high-uncertainty hands; cede the others.
-                if uncertainty > 0.75:
-                    true_value *= 1.40   # must compete in max-uncertainty spots
+        # Boundary below which we consider the opponent a "low bidder"
+        # (roughly: half of a max-uncertainty VOI at a 100-chip pot).
+        VOI_THRESHOLD = max(10, int(pot * 0.07))
+
+        n_obs = len(self._opp_auction_bids)
+        opp_estimate = None
+
+        if n_obs >= 5:
+            opp_avg_all    = sum(self._opp_auction_bids) / n_obs
+            recent         = self._opp_auction_bids[-15:]
+            opp_avg_recent = sum(recent) / len(recent)
+            # Weight recent bids 65% — opponents adjust strategy over time
+            opp_estimate   = 0.35 * opp_avg_all + 0.65 * opp_avg_recent
+
+            win_rate = self._auction_wins / max(self._auction_total, 1)
+
+            if opp_estimate < VOI_THRESHOLD:
+                # ──── LOW BIDDER: strictly enforce < 70% win rate ────
+                # Winning every auction against a low bidder bleeds chips and
+                # gains little — info from 1 card rarely covers the chip cost.
+                # Target: 40–65% win rate, hard ceiling at 70%.
+                #   • CONCEDE on clear winners/losers (info doesn't change action)
+                #   • CONTEST only on high-uncertainty spots where info matters
+                #   • Hard-concede whenever win_rate is approaching 70%
+                win_rate = self._auction_wins / max(self._auction_total, 1)
+
+                # Graduated contest threshold — gets stricter as win rate rises.
+                # Hard ceiling: once at/above 65%, contest only peak-uncertainty hands.
+                if self._auction_total >= 10 and win_rate >= 0.65:
+                    # Approaching ceiling — concede everything except maximum
+                    # uncertainty spots (equity right at 0.50, uncertainty > 0.85)
+                    contest_threshold = 0.85
+                elif self._auction_total >= 10 and win_rate >= 0.55:
+                    # Getting high — raise the bar significantly
+                    contest_threshold = 0.70
+                elif self._auction_total >= 10 and win_rate >= 0.40:
+                    # Healthy range — contest top third of uncertainty distribution
+                    contest_threshold = 0.55
+                elif self._auction_total >= 10 and win_rate < 0.30:
+                    # Too low — fight a bit more
+                    contest_threshold = 0.35
                 else:
-                    true_value *= 0.55   # not worth overpaying
-            elif win_rate > 0.75:
-                # We win almost every auction — opponent bids very low.
-                # Reduce bids to conserve chips (we'll still win cheaply).
-                true_value *= 0.70
-            elif 0.40 <= win_rate <= 0.60 and uncertainty > 0.60:
-                # Well-calibrated contest — slight upward nudge in key spots.
-                true_value *= 1.10
+                    # Early rounds / no data yet — moderate contest rate
+                    contest_threshold = 0.50
+
+                if uncertainty >= contest_threshold:
+                    # Contest: bid just above opponent's level (cheap win)
+                    margin     = 1 + int(uncertainty * 3)   # 1–4 chip buffer
+                    target_bid = int(opp_estimate) + margin
+                    target_bid = max(target_bid, 1)
+                    true_value = float(target_bid)
+                else:
+                    # Concede: bid well below opponent so they win without effort.
+                    # Use 25% of their estimate (not 40%) for a cleaner concede —
+                    # ensures we don't accidentally tie due to integer rounding.
+                    concede_bid = max(0, int(opp_estimate * 0.25))
+                    true_value  = float(concede_bid)
+
+            else:
+                # ──── HIGH BIDDER: bid competitively above their estimate ────
+                # 20% buffer guarantees we beat them most rounds while still
+                # paying only their (lower) bid back (second-price benefit).
+                target_bid = opp_estimate * 1.20
+                if true_value < target_bid:
+                    # VOI is below what opp typically bids — scale up.
+                    # Cap at 2.5× VOI so weak hands don’t inflate to absurdity.
+                    true_value = min(target_bid, true_value * 2.5)
+
+                # Still losing >65% despite upward adjustment — push harder.
+                if self._auction_total >= 15 and win_rate < 0.35:
+                    true_value *= 1.30
+                # Winning >70% against a "high" bidder — trim slightly.
+                elif self._auction_total >= 15 and win_rate > 0.70:
+                    true_value = max(true_value * 0.85, opp_estimate * 1.10)
 
         # ── Step 6: Final Bid Computation ─────────────────────────────────────
         bid = int(max(0.0, true_value))
 
-        # FLOOR bids — per Bowling (2015): never bid 0 in uncertain spots.
-        # A bid of even 1 forces opponent to pay ≥ 1 to win (better than free).
-        # Floors calibrated to Sklansky hand tiers + our equity table:
-        if equity >= 0.72:                          # TT+ / AKs  — always contest
-            bid = max(bid, BIG_BLIND * 4)
-        elif equity >= 0.62:                        # 88-99 / AQs-AKo
-            bid = max(bid, BIG_BLIND * 3)
-        elif equity >= 0.55:                        # strong broadway / suited aces
-            bid = max(bid, BIG_BLIND * 2)
-        elif equity >= 0.48:                        # coin-flip territory
-            bid = max(bid, BIG_BLIND)
-        elif equity >= 0.40:                        # slight underdog — token bid
-            bid = max(bid, BIG_BLIND // 2)
+        # FLOOR bids — dynamically scaled to opponent's bid level.
+        # LOW BIDDER:  true_value was already set to opp_estimate + margin in
+        #              Step 5, so use tiny symbolic floors that won't override
+        #              the shaded-down value and bleed chips unnecessarily.
+        # HIGH BIDDER / no data yet: use standard Sklansky-tier floors to
+        #              guarantee participation in the most valuable spots.
+        is_low_bidder = (opp_estimate is not None and opp_estimate < VOI_THRESHOLD)
+
+        if is_low_bidder:
+            # Only apply a floor in genuinely uncertain spots (equity near 50%)
+            # so we guarantee winning the info when it matters most.
+            if equity >= 0.48:
+                bid = max(bid, 1)
+            # else: bid whatever Step 5 computed (may be 0 for weak hands)
+        else:
+            # Standard floors: ensure competitive participation
+            if equity >= 0.72:                      # TT+ / AKs  — always contest
+                bid = max(bid, BIG_BLIND * 4)
+            elif equity >= 0.62:                    # 88-99 / AQs-AKo
+                bid = max(bid, BIG_BLIND * 3)
+            elif equity >= 0.55:                    # strong broadway / suited aces
+                bid = max(bid, BIG_BLIND * 2)
+            elif equity >= 0.48:                    # coin-flip territory
+                bid = max(bid, BIG_BLIND)
+            elif equity >= 0.40:                    # slight underdog — token bid
+                bid = max(bid, BIG_BLIND // 2)
         # Below 0.40: bid = 0 is correct (losing hand, info won't help)
 
-        # CEILING — Libratus principle: chip EV > individual hand EV.
-        # Never pay more than 30% of pot or 15% of stack for information.
-        max_sensible = min(
-            max_bid,
-            max(int(pot * 0.30), int(s.my_chips * 0.15))
-        )
+        # CEILING — Libratus chip-preservation principle.
+        # LOW BIDDER:  tight ceiling — no reason to pay more than ~2× their avg.
+        # HIGH BIDDER: standard ceiling 30% pot / 15% stack.
+        if is_low_bidder:
+            max_sensible = min(max_bid, max(int(opp_estimate * 2) + 5, int(s.my_chips * 0.04)))
+        else:
+            max_sensible = min(max_bid, max(int(pot * 0.30), int(s.my_chips * 0.15)))
         bid = min(bid, max_sensible)
 
         self._auction_my_bid = bid
