@@ -465,19 +465,6 @@ class Player(BaseBot):
 
         # ── Clamp & return ──
         bid = int(max(0, min(true_value, max_bid)))
-
-        # FIX #1: NEVER bid 0 on hands where information clearly matters.
-        # If we have decent equity (>=55%), gifting the opponent free info
-        # lets them play perfectly vs. us for the rest of the hand.
-        # Floor the bid so we always compete on meaningful hands.
-        if equity >= 0.65:
-            bid = max(bid, BIG_BLIND * 2)       # premium hand — always compete
-        elif equity >= 0.55:
-            bid = max(bid, BIG_BLIND)            # strong hand — always bid something
-        elif equity >= 0.45:
-            bid = max(bid, BIG_BLIND // 2)       # slight edge — token bid to compete
-
-        bid = min(bid, max_bid)
         self._auction_my_bid = bid
         return ActionBid(bid)
 
@@ -610,34 +597,16 @@ class Player(BaseBot):
 
         elif self.opp_won_auction and self.info_advantage < 0:
             # ── OPPONENT won the auction, they see one of our cards ──
-            # Play significantly tighter: they know part of our hand and can
-            # call/fold correctly. Our bluffs have no fold equity.
-            # FIX #2: Increase fold sensitivity substantially — stop calling
-            # down with marginal holdings when opponent has an info edge.
-            aggression_boost = -0.08
-            fold_tighten = -0.06   # much easier to fold (negative = fold more)
-            bluff_dampener = 0.2   # cut bluffs by 80%
+            # Play tighter: less bluffing, higher equity thresholds to bet.
+            aggression_boost = -0.05
+            fold_tighten = -0.02
+            bluff_dampener = 0.4     # cut bluffs by 60%
 
         # Adjusted thresholds
         value_bet_threshold   = 0.70 - aggression_boost
         medium_bet_threshold  = 0.55 - aggression_boost
         marginal_threshold    = 0.40 - aggression_boost * 0.5
         call_cushion          = 0.05 - fold_tighten
-
-        # FIX #4 : ALL-IN PROTECTION
-        # Never commit > 70% of chips (raise or call) unless equity justifies it.
-        # This prevents 'Round 7' type disasters where we call off our stack
-        # with marginal made hands when opponent has information advantage.
-        if s.street == 'river' and cost > 0:
-            commitment_ratio = cost / max(s.my_chips, 1)
-            if commitment_ratio > 0.60 and equity < 0.70:
-                # Huge river bet facing us — only stay in with clear value
-                if equity < 0.60 and s.can_act(ActionFold):
-                    return ActionFold()
-            if commitment_ratio > 0.40 and equity < 0.55 and self.info_advantage < 0:
-                # Opponent has info + we are marginal + facing big bet = fold
-                if s.can_act(ActionFold):
-                    return ActionFold()
 
         # --- Facing a bet (cost > 0) ---
         if cost > 0:
@@ -663,16 +632,6 @@ class Player(BaseBot):
                 return ActionCall()
 
             # Drawing / weak — fold unless getting great odds
-            # FIX #2b: When opponent has info advantage, NEVER call here —
-            # they know our hand so their bet is almost always value, not a bluff.
-            if self.info_advantage < 0:
-                # Opponent has our card — only call if clearly profitable
-                if equity >= pot_odds + 0.12:
-                    return ActionCall()
-                if s.can_act(ActionFold):
-                    return ActionFold()
-                return ActionCall()
-
             if equity >= pot_odds - call_cushion and cost <= pot * 0.35:
                 return ActionCall()
 
@@ -710,18 +669,6 @@ class Player(BaseBot):
             return ActionCheck()
 
         # Weak — check, occasionally bluff
-        # FIX #3 : BRICK EXPLOITATION
-        # When we see opponent's card and it completely misses the board,
-        # they almost certainly have air/draw. Bet every street, not randomly.
-        if self.info_advantage > 0 and self.opp_card_board_str < 0.20:
-            # Opponent card is a total brick — pressure them every street
-            if s.street in ('flop', 'turn'):
-                bet_size = int(pot * 0.55)
-                return self._make_raise(s, max(BIG_BLIND, bet_size))
-            # River: large sizing to maximise fold pressure
-            if s.street == 'river':
-                bet_size = int(pot * 0.75)
-                return self._make_raise(s, max(BIG_BLIND, bet_size))
         # INFO-AWARE BLUFFING: bluff MORE when we have info (we know opp is weak),
         # bluff LESS when opp has info (they'll call correctly)
         if s.street == 'river':
