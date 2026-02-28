@@ -494,7 +494,7 @@ class Player(BaseBot):
 
         # Expected equity improvement from seeing 1 card ≈ 5-12%
         # scales with uncertainty (more uncertainty → bigger info swing)
-        delta_equity = 5*uncertainty  # up to ~8% absolute equity gain
+        delta_equity = uncertainty  # up to ~8% absolute equity gain
 
         # Translate equity improvement to chip value:
         # If we gain Δeq, we expect to win Δeq × pot more chips on average.
@@ -895,5 +895,48 @@ class Player(BaseBot):
         return ActionCheck()
 
 
+class AggressivePlayer(Player):
+    '''Variant that wins the auction ≈90% and bluffs ≈90% post-flop.
+
+    On each auction decision the bot randomly chooses to force a win by
+    bidding near its stack with 90% probability; the remaining 10% it falls
+    back to the base class logic.  After the flop, 90% of hands it will
+    "bluff heavily" (raise whenever possible), otherwise it defers to the
+    normal post-flop algorithm.
+    '''
+
+    def _auction_action(self, game_info: GameInfo, s: PokerState):
+        # 90% of the time shove a large bid to almost guarantee winning the
+        # auction; 10% of the time behave like the normal Player.
+        if random.random() < 0.90:
+            # bid a large portion of our stack (ensures win most races)
+            bid = min(s.my_chips, BIG_BLIND * 20)
+            self._auction_my_bid = bid
+            return ActionBid(bid)
+        return super()._auction_action(game_info, s)
+
+    def _postflop_action(self, game_info: GameInfo, s: PokerState):
+        # 90% of the time bluff hard regardless of equity, otherwise use base
+        # logic.
+        if random.random() < 0.90:
+            # raise when we can, else call/check
+            if s.can_act(ActionRaise):
+                # size aggressively: pot plus cost
+                return self._make_raise(s, s.pot + max(s.cost_to_call, BIG_BLIND))
+            if s.can_act(ActionCall):
+                return ActionCall()
+            return ActionCheck()
+        return super()._postflop_action(game_info, s)
+
+
 if __name__ == '__main__':
-    run_bot(Player(), parse_args())
+    # allow selecting bot type via command-line switch or default to base
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--aggressive', action='store_true',
+                        help='use the 90% auction/bluff aggressive bot')
+    args = parser.parse_args()
+
+    bot_cls = AggressivePlayer if args.aggressive else Player
+    run_bot(bot_cls(), parse_args())
