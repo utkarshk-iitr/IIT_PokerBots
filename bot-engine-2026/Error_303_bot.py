@@ -1,30 +1,3 @@
-"""
-fix_bot.py  —  SneakBot v4 (Hardened Edition)
-=======================================================
-Built on SneakBot v3 (MIT-Architecture) with 7 critical fixes:
-
-  FIX 1: Big-pot protection on ALL streets (flop/turn/river)
-         — Prevents catastrophic 4000-5000 chip losses in single hands
-
-  FIX 2: Bet-size-aware equity discounting
-         — Large bets signal strong hands; discount MC equity accordingly
-
-  FIX 3: Randomized bet sizing
-         — Prevents opponents from reading identical bet patterns
-
-  FIX 4: Hidden second card awareness
-         — When visible card is "air" but opponent bets big, upgrade threat
-
-  FIX 5: Anti-extreme-bidder strategy
-         — Counter binary bidders (0 or 1245) with adaptive auction play
-
-  FIX 6: Tighter calling when opponent has info
-         — When opponent sees our card and bets big, fold more often
-
-  FIX 7: Re-raise escalation caps
-         — Never re-raise with marginal hands; cap escalation
-"""
-
 import random
 import math
 import itertools
